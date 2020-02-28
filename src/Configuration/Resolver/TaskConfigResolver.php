@@ -13,10 +13,10 @@ class TaskConfigResolver
     /**
      * @var array<string, string>
      */
-    private $taskMap = [];
+    private $taskMap;
 
     /**
-     * @var array<OptionsResolver>
+     * @var OptionsResolver[]
      */
     private $cachedResolvers = [];
 
@@ -26,7 +26,7 @@ class TaskConfigResolver
     }
 
     /**
-     * @return array<string>
+     * @return string[]
      */
     public function listAvailableTaskNames(): array
     {

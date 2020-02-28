@@ -9,17 +9,16 @@ use GrumPHP\Configuration\Resolver\TaskConfigResolver;
 use GrumPHP\Util\Filesystem;
 use GrumPHP\Util\Paths;
 use Symfony\Component\Console\Command\Command;
-use Symfony\Component\Console\Helper\QuestionHelper;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Question\ChoiceQuestion;
-use Symfony\Component\Console\Question\ConfirmationQuestion;
+use Symfony\Component\Console\Style\SymfonyStyle;
 use Symfony\Component\Yaml\Yaml;
 
 class ConfigureCommand extends Command
 {
-    const COMMAND_NAME = 'configure';
+    protected static $defaultName = 'configure';
 
     /**
      * @var TaskConfigResolver
@@ -36,11 +35,6 @@ class ConfigureCommand extends Command
      */
     private $paths;
 
-    /**
-     * @var InputInterface
-     */
-    protected $input;
-
     public function __construct(TaskConfigResolver $taskConfigResolver, Filesystem $filesystem, Paths $paths)
     {
         parent::__construct();
@@ -50,126 +44,83 @@ class ConfigureCommand extends Command
         $this->paths = $paths;
     }
 
-    public static function getDefaultName(): string
-    {
-        return self::COMMAND_NAME;
-    }
-
-    /**
-     * Configure command.
-     */
     protected function configure(): void
     {
         $this->addOption(
-            'force',
+            'skip-if-exists',
             null,
-            InputOption::VALUE_NONE,
-            'Forces overwriting the configuration file when it already exists.'
-        );
-        $this->addOption(
-            'silent',
-            null,
-            InputOption::VALUE_NONE,
-            'Only output what really matters.'
+            InputOption::VALUE_OPTIONAL,
+            'Skip configuration process if the configuration file already exists.',
+            false
         );
     }
 
-    /**
-     * @return int|void
-     */
     public function execute(InputInterface $input, OutputInterface $output): int
     {
-        $this->input = $input;
-        $configFile = $this->paths->getConfigFile();
-        $force = $input->getOption('force');
-        if ($this->filesystem->exists($configFile) && !$force) {
-            if (!$input->getOption('silent')) {
-                $output->writeln('<fg=yellow>GrumPHP is already configured!</fg=yellow>');
-            }
+        $io = new SymfonyStyle($input, $output);
+
+        $skip = $input->getOption('skip-if-exists') !== false;
+
+        $configFileLocation = $this->paths->getConfigFile();
+
+        if (!$input->isInteractive()) {
+            $io->block('Skipping configuration due to no interaction.');
+
+            return 0;
+        }
+        $configFileExists = $this->filesystem->exists($configFileLocation);
+        if ($configFileExists && $skip) {
+            $io->warning('Configuration process skipped since the configuration file already exists.');
 
             return 0;
         }
 
-        // Check configuration:
-        $configuration = $this->buildConfiguration($input, $output);
-        if (!$configuration) {
-            $output->writeln('<fg=yellow>Skipped configuring GrumPHP. Using default configuration.</fg=yellow>');
-
-            return 0;
-        }
-
-        // Check write action
-        $written = $this->writeConfiguration($configFile, $configuration);
-        if (!$written) {
-            $output->writeln('<fg=red>The configuration file could not be saved. Give me some permissions!</fg=red>');
+        $currentConfiguration = (array) Yaml::parseFile($configFileLocation);
+        $configuration = $this->configureTasks($io, $currentConfiguration);
+        try {
+            $yaml = Yaml::dump($configuration, 10, 2);
+            $this->filesystem->dumpFile($configFileLocation, $yaml);
+        } catch (Exception $e) {
+            $io->error('The configuration file could not be saved. '.$e->getMessage());
 
             return 1;
         }
 
-        if (!$input->getOption('silent')) {
-            $output->writeln('<fg=green>GrumPHP is configured and ready to kick ass!</fg=green>');
-        }
+        $io->success('GrumPHP is configured and ready to kick ass!');
 
         return 0;
     }
 
-    /**
-     * This method will ask the developer for it's input and will result in a configuration array.
-     */
-    protected function buildConfiguration(InputInterface $input, OutputInterface $output): array
+    private function configureTasks(SymfonyStyle $io, $configuration): array
     {
-        /** @var QuestionHelper $helper */
-        $helper = $this->getHelper('question');
+        $taskNames = $this->taskConfigResolver->listAvailableTaskNames();
+        $question = new ChoiceQuestion('Which task do you want to configure?', $taskNames);
 
-        $questionString = $this->createQuestionString(
-            'Do you want to create a grumphp.yml file?',
-            'Yes'
-        );
+        do {
+            $task = $io->askQuestion($question);
 
-        $question = new ConfirmationQuestion($questionString, true);
-        if (!$helper->ask($input, $output, $question)) {
-            return [];
-        }
+            $optionsResolver = $this->taskConfigResolver->fetchByName($task);
+            $options = $optionsResolver->resolve();
 
-        // Search tasks
-        $tasks = [];
-        if ($input->isInteractive()) {
-            $question = new ChoiceQuestion(
-                $this->createQuestionString('Which tasks do you want to run?', null, ''),
-                $this->taskConfigResolver->listAvailableTaskNames()
-            );
-            $question->setMultiselect(true);
-            $tasks = (array) $helper->ask($input, $output, $question);
-        }
+            if (!$this->confirmOverride($io, $configuration, $task)) {
+                continue;
+            }
 
-        // Build configuration
-        return [
-            'parameters' => [
-                'tasks' => array_map(function ($task) {
-                    return null;
-                }, array_flip($tasks)),
-            ],
-        ];
+            $configuration['parameters']['tasks'][$task] = $options;
+        } while ($io->confirm('Do you want to configure another task?'));
+
+        return $configuration;
     }
 
-    protected function createQuestionString(string $question, string $default = null, string $separator = ':'): string
+    private function confirmOverride(SymfonyStyle $io, $configuration, $task): bool
     {
-        return null !== $default ?
-            sprintf('<fg=green>%s</fg=green> [<fg=yellow>%s</fg=yellow>]%s ', $question, $default, $separator) :
-            sprintf('<fg=green>%s</fg=green>%s ', $question, $separator);
-    }
-
-    protected function writeConfiguration(string $configFile, array $configuration): bool
-    {
-        try {
-            $yaml = Yaml::dump($configuration);
-            $this->filesystem->dumpFile($configFile, $yaml);
-
+        if (!isset($configuration['parameters']['tasks'][$task])) {
             return true;
-        } catch (Exception $e) {
-            // Fail silently and return false!
         }
 
-        return false;
+        return $io->confirm(
+            'Task '.$task.' already exists. Do you want to overwrite the current configuration with the default one?',
+            false
+        );
     }
 }
